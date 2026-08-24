@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -15,6 +17,7 @@ import (
 const (
 	ollamaURL     = "http://localhost:11434"
 	embedModel    = "nomic-embed-text"
+	topK          = 5
 	memoryRelPath = ".ollama-mem/memory.jsonl"
 )
 
@@ -57,6 +60,19 @@ func embed(text string) ([]float64, error) {
 		return nil, fmt.Errorf("no embedding returned, is model '%s' pulled?", embedModel)
 	}
 	return er.Embeddings[0], nil
+}
+
+func cosineSim(a, b []float64) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
 func loadMemories() ([]Memory, error) {
@@ -117,6 +133,48 @@ func remember(text string) error {
 	}
 	fmt.Printf("Remembered: %q\n", text)
 	return nil
+}
+
+type scored struct {
+	mem   Memory
+	score float64
+}
+
+func retrieveContext(query string) (string, error) {
+	mems, err := loadMemories()
+	if err != nil {
+		return "", err
+	}
+	if len(mems) == 0 {
+		return "", nil
+	}
+
+	qvec, err := embed(query)
+	if err != nil {
+		return "", err
+	}
+
+	scoredMems := make([]scored, 0, len(mems))
+	for _, m := range mems {
+		scoredMems = append(scoredMems, scored{mem: m, score: cosineSim(qvec, m.Embedding)})
+	}
+	sort.Slice(scoredMems, func(i, j int) bool { return scoredMems[i].score > scoredMems[j].score })
+
+	n := topK
+	if n > len(scoredMems) {
+		n = len(scoredMems)
+	}
+
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		if scoredMems[i].score < 0.3 {
+			continue
+		}
+		sb.WriteString("- ")
+		sb.WriteString(scoredMems[i].mem.Text)
+		sb.WriteString("\n")
+	}
+	return sb.String(), nil
 }
 
 func printUsage() {
