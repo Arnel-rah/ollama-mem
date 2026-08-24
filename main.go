@@ -106,6 +106,19 @@ func appendMemory(m Memory) error {
 	return err
 }
 
+func remember(text string) error {
+	vec, err := embed(text)
+	if err != nil {
+		return err
+	}
+	m := Memory{Text: text, Embedding: vec, CreatedAt: time.Now()}
+	if err := appendMemory(m); err != nil {
+		return err
+	}
+	fmt.Printf("Remembered: %q\n", text)
+	return nil
+}
+
 func printUsage() {
 	fmt.Println(`ollama-mem — persistent memory for Ollama
 
@@ -119,6 +132,27 @@ Usage:
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
+		os.Exit(1)
+	}
+
+	cmd := os.Args[1]
+	args := strings.Join(os.Args[2:], " ")
+
+	var err error
+	switch cmd {
+	case "remember":
+		if args == "" {
+			fmt.Println("Error: provide text to remember")
+			os.Exit(1)
+		}
+		err = remember(args)
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
