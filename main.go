@@ -2,20 +2,35 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-const memoryRelPath = ".ollama-mem/memory.jsonl"
+const (
+	ollamaURL     = "http://localhost:11434"
+	embedModel    = "nomic-embed-text"
+	memoryRelPath = ".ollama-mem/memory.jsonl"
+)
 
 type Memory struct {
 	Text      string    `json:"text"`
 	Embedding []float64 `json:"embedding"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type embedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
+}
+
+type embedResponse struct {
+	Embeddings [][]float64 `json:"embeddings"`
 }
 
 func memoryPath() string {
@@ -24,6 +39,24 @@ func memoryPath() string {
 		home = "."
 	}
 	return filepath.Join(home, memoryRelPath)
+}
+
+func embed(text string) ([]float64, error) {
+	body, _ := json.Marshal(embedRequest{Model: embedModel, Input: text})
+	resp, err := http.Post(ollamaURL+"/api/embed", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("embed call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var er embedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		return nil, fmt.Errorf("embed decode: %w", err)
+	}
+	if len(er.Embeddings) == 0 {
+		return nil, fmt.Errorf("no embedding returned, is model '%s' pulled?", embedModel)
+	}
+	return er.Embeddings[0], nil
 }
 
 func loadMemories() ([]Memory, error) {
