@@ -1,0 +1,26 @@
+# Binaries
+ollama-mem
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local memory storage (should never be committed)
+*.jsonl
+.ollama-mem/
+
+# Editor/OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
