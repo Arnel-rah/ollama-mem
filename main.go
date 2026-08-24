@@ -61,6 +61,30 @@ func memoryPath() string {
 	return filepath.Join(home, memoryRelPath)
 }
 
+func listMemories() error {
+	mems, err := loadMemories()
+	if err != nil {
+		return err
+	}
+	if len(mems) == 0 {
+		fmt.Println("No memories stored.")
+		return nil
+	}
+	for i, m := range mems {
+		fmt.Printf("%d. [%s] %s\n", i+1, m.CreatedAt.Format("2006-01-02 15:04"), m.Text)
+	}
+	return nil
+}
+
+func clearMemories() error {
+	path := memoryPath()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fmt.Println("Memory cleared.")
+	return nil
+}
+
 func embed(text string) ([]float64, error) {
 	body, _ := json.Marshal(embedRequest{Model: embedModel, Input: text})
 	resp, err := http.Post(ollamaURL+"/api/embed", "application/json", bytes.NewReader(body))
@@ -269,6 +293,11 @@ func main() {
 			os.Exit(1)
 		}
 		err = chatWithMemory(args)
+	case "list":
+		err = listMemories()
+	case "clear":
+		err = clearMemories()
+
 	default:
 		printUsage()
 		os.Exit(1)
