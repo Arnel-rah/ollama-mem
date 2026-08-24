@@ -22,6 +22,8 @@ const (
 	memoryRelPath = ".ollama-mem/memory.jsonl"
 )
 
+var version = "dev"
+
 type Memory struct {
 	Text      string    `json:"text"`
 	Embedding []float64 `json:"embedding"`
@@ -54,6 +56,9 @@ type chatResponseChunk struct {
 }
 
 func memoryPath() string {
+	if dir := os.Getenv("OLLAMA_MEM_DIR"); dir != "" {
+		return filepath.Join(dir, "memory.jsonl")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
@@ -61,44 +66,20 @@ func memoryPath() string {
 	return filepath.Join(home, memoryRelPath)
 }
 
-func listMemories() error {
-	mems, err := loadMemories()
-	if err != nil {
-		return err
-	}
-	if len(mems) == 0 {
-		fmt.Println("No memories stored.")
-		return nil
-	}
-	for i, m := range mems {
-		fmt.Printf("%d. [%s] %s\n", i+1, m.CreatedAt.Format("2006-01-02 15:04"), m.Text)
-	}
-	return nil
-}
-
-func clearMemories() error {
-	path := memoryPath()
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	fmt.Println("Memory cleared.")
-	return nil
-}
-
 func embed(text string) ([]float64, error) {
 	body, _ := json.Marshal(embedRequest{Model: embedModel, Input: text})
 	resp, err := http.Post(ollamaURL+"/api/embed", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("embed call: %w", err)
+		return nil, fmt.Errorf("appel embed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var er embedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
-		return nil, fmt.Errorf("embed decode: %w", err)
+		return nil, fmt.Errorf("decode embed: %w", err)
 	}
 	if len(er.Embeddings) == 0 {
-		return nil, fmt.Errorf("no embedding returned, is model '%s' pulled?", embedModel)
+		return nil, fmt.Errorf("aucun embedding retourné, modèle '%s' disponible ?", embedModel)
 	}
 	return er.Embeddings[0], nil
 }
@@ -181,6 +162,35 @@ type scored struct {
 	score float64
 }
 
+const minSimilarityScore = 0.3
+
+func rankMemories(qvec []float64, mems []Memory) []scored {
+	scoredMems := make([]scored, 0, len(mems))
+	for _, m := range mems {
+		scoredMems = append(scoredMems, scored{mem: m, score: cosineSim(qvec, m.Embedding)})
+	}
+	sort.Slice(scoredMems, func(i, j int) bool { return scoredMems[i].score > scoredMems[j].score })
+	return scoredMems
+}
+
+func formatContext(ranked []scored) string {
+	n := topK
+	if n > len(ranked) {
+		n = len(ranked)
+	}
+
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		if ranked[i].score < minSimilarityScore {
+			continue
+		}
+		sb.WriteString("- ")
+		sb.WriteString(ranked[i].mem.Text)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 func retrieveContext(query string) (string, error) {
 	mems, err := loadMemories()
 	if err != nil {
@@ -195,27 +205,8 @@ func retrieveContext(query string) (string, error) {
 		return "", err
 	}
 
-	scoredMems := make([]scored, 0, len(mems))
-	for _, m := range mems {
-		scoredMems = append(scoredMems, scored{mem: m, score: cosineSim(qvec, m.Embedding)})
-	}
-	sort.Slice(scoredMems, func(i, j int) bool { return scoredMems[i].score > scoredMems[j].score })
-
-	n := topK
-	if n > len(scoredMems) {
-		n = len(scoredMems)
-	}
-
-	var sb strings.Builder
-	for i := 0; i < n; i++ {
-		if scoredMems[i].score < 0.3 {
-			continue
-		}
-		sb.WriteString("- ")
-		sb.WriteString(scoredMems[i].mem.Text)
-		sb.WriteString("\n")
-	}
-	return sb.String(), nil
+	ranked := rankMemories(qvec, mems)
+	return formatContext(ranked), nil
 }
 
 func chatWithMemory(query string) error {
@@ -224,9 +215,9 @@ func chatWithMemory(query string) error {
 		return err
 	}
 
-	systemPrompt := "You are a helpful technical assistant."
+	systemPrompt := "Tu es un assistant technique utile."
 	if context != "" {
-		systemPrompt += "\n\nRelevant memory about the user:\n" + context
+		systemPrompt += "\n\nContexte utile mémorisé sur l'utilisateur :\n" + context
 	}
 
 	reqBody := chatRequest{
@@ -241,7 +232,7 @@ func chatWithMemory(query string) error {
 
 	resp, err := http.Post(ollamaURL+"/api/chat", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("chat call: %w", err)
+		return fmt.Errorf("appel chat: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -261,13 +252,37 @@ func chatWithMemory(query string) error {
 }
 
 func printUsage() {
-	fmt.Println(`ollama-mem — persistent memory for Ollama
+	fmt.Println(`ollama-mem — mémoire persistante pour Ollama
 
 Usage:
-  ollama-mem remember "text to store"
-  ollama-mem ask "your question"
+  ollama-mem remember "texte à retenir"
+  ollama-mem ask "ta question"
   ollama-mem list
   ollama-mem clear`)
+}
+
+func listMemories() error {
+	mems, err := loadMemories()
+	if err != nil {
+		return err
+	}
+	if len(mems) == 0 {
+		fmt.Println("No memories stored.")
+		return nil
+	}
+	for i, m := range mems {
+		fmt.Printf("%d. [%s] %s\n", i+1, m.CreatedAt.Format("2006-01-02 15:04"), m.Text)
+	}
+	return nil
+}
+
+func clearMemories() error {
+	path := memoryPath()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fmt.Println("Memory cleared.")
+	return nil
 }
 
 func main() {
@@ -297,7 +312,8 @@ func main() {
 		err = listMemories()
 	case "clear":
 		err = clearMemories()
-
+	case "version":
+		fmt.Println(version)
 	default:
 		printUsage()
 		os.Exit(1)
