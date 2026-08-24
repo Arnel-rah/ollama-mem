@@ -17,6 +17,7 @@ import (
 const (
 	ollamaURL     = "http://localhost:11434"
 	embedModel    = "nomic-embed-text"
+	chatModel     = "qwen2.5-coder:7b"
 	topK          = 5
 	memoryRelPath = ".ollama-mem/memory.jsonl"
 )
@@ -34,6 +35,22 @@ type embedRequest struct {
 
 type embedResponse struct {
 	Embeddings [][]float64 `json:"embeddings"`
+}
+
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+}
+
+type chatResponseChunk struct {
+	Message chatMessage `json:"message"`
+	Done    bool        `json:"done"`
 }
 
 func memoryPath() string {
@@ -177,6 +194,48 @@ func retrieveContext(query string) (string, error) {
 	return sb.String(), nil
 }
 
+func chatWithMemory(query string) error {
+	context, err := retrieveContext(query)
+	if err != nil {
+		return err
+	}
+
+	systemPrompt := "You are a helpful technical assistant."
+	if context != "" {
+		systemPrompt += "\n\nRelevant memory about the user:\n" + context
+	}
+
+	reqBody := chatRequest{
+		Model: chatModel,
+		Messages: []chatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: query},
+		},
+		Stream: true,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	resp, err := http.Post(ollamaURL+"/api/chat", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("chat call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var chunk chatResponseChunk
+		if err := decoder.Decode(&chunk); err != nil {
+			break
+		}
+		fmt.Print(chunk.Message.Content)
+		if chunk.Done {
+			break
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
 func printUsage() {
 	fmt.Println(`ollama-mem — persistent memory for Ollama
 
@@ -204,6 +263,12 @@ func main() {
 			os.Exit(1)
 		}
 		err = remember(args)
+	case "ask":
+		if args == "" {
+			fmt.Println("Error: provide a question")
+			os.Exit(1)
+		}
+		err = chatWithMemory(args)
 	default:
 		printUsage()
 		os.Exit(1)
