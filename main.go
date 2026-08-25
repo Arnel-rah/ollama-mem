@@ -3,26 +3,30 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	ollamaURL     = "http://localhost:11434"
-	embedModel    = "nomic-embed-text"
-	chatModel     = "qwen2.5-coder:7b"
-	topK          = 5
-	memoryRelPath = ".ollama-mem/memory.jsonl"
+	ollamaURL          = "http://localhost:11434"
+	embedModel         = "nomic-embed-text"
+	chatModel          = "qwen2.5-coder:7b"
+	topK               = 5
+	memoryRelPath      = ".ollama-mem/memory.jsonl"
+	minSimilarityScore = 0.3
 )
 
-var version = "dev"
+var (
+	version    = "dev"
+	httpClient = &http.Client{Timeout: 120 * time.Second}
+)
 
 type Memory struct {
 	Text      string    `json:"text"`
@@ -55,6 +59,25 @@ type chatResponseChunk struct {
 	Done    bool        `json:"done"`
 }
 
+type scored struct {
+	mem   Memory
+	score float64
+}
+
+type scoreHeap []scored
+
+func (h scoreHeap) Len() int           { return len(h) }
+func (h scoreHeap) Less(i, j int) bool { return h[i].score < h[j].score }
+func (h scoreHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *scoreHeap) Push(x any)        { *h = append(*h, x.(scored)) }
+func (h *scoreHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
 func memoryPath() string {
 	if dir := os.Getenv("OLLAMA_MEM_DIR"); dir != "" {
 		return filepath.Join(dir, "memory.jsonl")
@@ -67,8 +90,11 @@ func memoryPath() string {
 }
 
 func embed(text string) ([]float64, error) {
-	body, _ := json.Marshal(embedRequest{Model: embedModel, Input: text})
-	resp, err := http.Post(ollamaURL+"/api/embed", "application/json", bytes.NewReader(body))
+	body, err := json.Marshal(embedRequest{Model: embedModel, Input: text})
+	if err != nil {
+		return nil, fmt.Errorf("marshal embed: %w", err)
+	}
+	resp, err := httpClient.Post(ollamaURL+"/api/embed", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("appel embed: %w", err)
 	}
@@ -84,24 +110,30 @@ func embed(text string) ([]float64, error) {
 	return er.Embeddings[0], nil
 }
 
-func cosineSim(a, b []float64) float64 {
-	var dot, na, nb float64
-	for i := range a {
-		dot += a[i] * b[i]
-		na += a[i] * a[i]
-		nb += b[i] * b[i]
-	}
-	if na == 0 || nb == 0 {
+func cosineSim(a, b []float64, aNorm float64) float64 {
+	if aNorm == 0 {
 		return 0
 	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+	var dot, bNormSq float64
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		dot += a[i] * b[i]
+		bNormSq += b[i] * b[i]
+	}
+	if bNormSq == 0 {
+		return 0
+	}
+	return dot / (aNorm * math.Sqrt(bNormSq))
 }
 
 func loadMemories() ([]Memory, error) {
 	path := memoryPath()
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return []Memory{}, nil
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
@@ -110,14 +142,16 @@ func loadMemories() ([]Memory, error) {
 
 	var mems []Memory
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var m Memory
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
+		if err := json.Unmarshal(line, &m); err != nil {
 			continue
 		}
 		mems = append(mems, m)
@@ -157,20 +191,36 @@ func remember(text string) error {
 	return nil
 }
 
-type scored struct {
-	mem   Memory
-	score float64
-}
-
-const minSimilarityScore = 0.3
-
 func rankMemories(qvec []float64, mems []Memory) []scored {
-	scoredMems := make([]scored, 0, len(mems))
-	for _, m := range mems {
-		scoredMems = append(scoredMems, scored{mem: m, score: cosineSim(qvec, m.Embedding)})
+	if len(mems) == 0 {
+		return nil
 	}
-	sort.Slice(scoredMems, func(i, j int) bool { return scoredMems[i].score > scoredMems[j].score })
-	return scoredMems
+
+	var qNormSq float64
+	for _, v := range qvec {
+		qNormSq += v * v
+	}
+	qNorm := math.Sqrt(qNormSq)
+
+	h := &scoreHeap{}
+	heap.Init(h)
+
+	for _, m := range mems {
+		score := cosineSim(qvec, m.Embedding, qNorm)
+
+		if h.Len() < topK {
+			heap.Push(h, scored{mem: m, score: score})
+		} else if score > (*h)[0].score {
+			(*h)[0] = scored{mem: m, score: score}
+			heap.Fix(h, 0)
+		}
+	}
+
+	result := make([]scored, h.Len())
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i] = heap.Pop(h).(scored)
+	}
+	return result
 }
 
 func formatContext(ranked []scored) string {
@@ -178,7 +228,6 @@ func formatContext(ranked []scored) string {
 	if n > len(ranked) {
 		n = len(ranked)
 	}
-
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
 		if ranked[i].score < minSimilarityScore {
@@ -186,7 +235,7 @@ func formatContext(ranked []scored) string {
 		}
 		sb.WriteString("- ")
 		sb.WriteString(ranked[i].mem.Text)
-		sb.WriteString("\n")
+		sb.WriteByte('\n')
 	}
 	return sb.String()
 }
@@ -199,12 +248,10 @@ func retrieveContext(query string) (string, error) {
 	if len(mems) == 0 {
 		return "", nil
 	}
-
 	qvec, err := embed(query)
 	if err != nil {
 		return "", err
 	}
-
 	ranked := rankMemories(qvec, mems)
 	return formatContext(ranked), nil
 }
@@ -228,9 +275,12 @@ func chatWithMemory(query string) error {
 		},
 		Stream: true,
 	}
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshal chat: %w", err)
+	}
 
-	resp, err := http.Post(ollamaURL+"/api/chat", "application/json", bytes.NewReader(body))
+	resp, err := httpClient.Post(ollamaURL+"/api/chat", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("appel chat: %w", err)
 	}
@@ -253,12 +303,12 @@ func chatWithMemory(query string) error {
 
 func printUsage() {
 	fmt.Println(`ollama-mem — mémoire persistante pour Ollama
-
 Usage:
   ollama-mem remember "texte à retenir"
   ollama-mem ask "ta question"
   ollama-mem list
-  ollama-mem clear`)
+  ollama-mem clear
+  ollama-mem version`)
 }
 
 func listMemories() error {
